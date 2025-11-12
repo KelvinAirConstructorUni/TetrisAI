@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Tetris Weight Trainer</title>
+    <style>
+        body {
+            font-family: monospace;
+            background: #111;
+            color: #0f0;
+            padding: 20px;
+        }
+
+        button {
+            margin-top: 20px;
+            padding: 10px 20px;
+            font-size: 16px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h2>Tetris Genetic Weight Trainer</h2>
+    <p>Open your browser console (F12) to see training progress.</p>
+
+    <button onclick="trainGenerations()">Train</button>
+
+    <script>
+        // ============================
+        // CONSTANTS + BOARD SIZE
+        // ============================
+        const nx = 10; // width
+        const ny = 20; // height
+
+        // ============================
+        // PIECES (fast version)
+        // Only types + rotations (4 states per piece)
+        // ============================
+        const i = { size: 4, blocks: [0x0F00, 0x2222, 0x00F0, 0x4444], color: "cyan" };
+        const j = { size: 3, blocks: [0x44C0, 0x8E00, 0x6440, 0x0E20], color: "blue" };
+        const l = { size: 3, blocks: [0x4460, 0x0E80, 0xC440, 0x2E00], color: "orange" };
+        const o = { size: 2, blocks: [0xCC00, 0xCC00, 0xCC00, 0xCC00], color: "yellow" };
+        const s = { size: 3, blocks: [0x06C0, 0x8C40, 0x6C00, 0x4620], color: "green" };
+        const t = { size: 3, blocks: [0x0E40, 0x4C40, 0x4E00, 0x4640], color: "purple" };
+        const z = { size: 3, blocks: [0x0C60, 0x4C80, 0xC600, 0x2640], color: "red" };
+
+        const pieceTypes = [i, j, l, o, s, t, z];
+
+        // ============================
+        // eachblock(type, x, y, dir, fn)
+        // This gives you (bx, by) of each cell in a piece rotation
+        // ============================
+        function eachblock(type, baseX, baseY, dir, fn) {
+            let bit = 0x8000;  // start from highest bit
+            let row = 0, col = 0;
+            const blk = type.blocks[dir];
+
+            while (bit > 0) {
+                if (blk & bit) {
+                    fn(baseX + col, baseY + row);
+                }
+                col++;
+                if (col === 4) { col = 0; row++; }
+                bit >>= 1;
+            }
+        }
+
+        // ============================
+        // fastOccupied – collision check
+        // ============================
+        function fastOccupied(type, x, y, dir, board) {
+            let collision = false;
+            eachblock(type, x, y, dir, (bx, by) => {
+                if (bx < 0 || bx >= nx || by < 0 || by >= ny) collision = true;
+                else if (board[bx][by]) collision = true;
+            });
+            return collision;
+        }
+
+        // ============================
+        // fastDrop – find final y position
+        // ============================
+        function fastDrop(type, x, dir, board) {
+            let y = 0;
+            while (true) {
+                if (fastOccupied(type, x, y + 1, dir, board)) break;
+                y++;
+                if (y >= ny - 1) break;
+            }
+            if (fastOccupied(type, x, y, dir, board)) return null; // invalid
+            return y;
+        }
+
+        // ============================
+        // copy board
+        // ============================
+        function copyBoard(board) {
+            return board.map(col => col.slice());
+        }
+
+        // ============================
+        // fast evaluation with weights
+        // ============================
+        function fastEvaluateBoard(board, w) {
+            let colHeights = Array(nx).fill(0);
+            let holes = 0;
+            let aggregateHeight = 0;
+            let bumpiness = 0;
+            let completeLines = 0;
+
+            // column heights + holes
+            for (let x = 0; x < nx; x++) {
+                let blockFound = false;
+                for (let y = 0; y < ny; y++) {
+                    if (board[x][y]) {
+                        if (!blockFound) {
+                            colHeights[x] = ny - y;
+                            aggregateHeight += colHeights[x];
+                            blockFound = true;
+                        }
+                    } else if (blockFound) {
+                        holes++;
+                    }
+                }
+            }
+
+            // bumpiness
+            for (let x = 0; x < nx - 1; x++) {
+                bumpiness += Math.abs(colHeights[x] - colHeights[x + 1]);
+            }
+
+            // complete lines
+            for (let y = 0; y < ny; y++) {
+                let ok = true;
+                for (let x = 0; x < nx; x++) {
+                    if (!board[x][y]) { ok = false; break; }
+                }
+                if (ok) completeLines++;
+            }
+
+            // well depth
+            let wellDepth = 0;
+            for (let x = 0; x < nx; x++) {
+                let left = x > 0 ? colHeights[x - 1] : Infinity;
+                let right = x < nx - 1 ? colHeights[x + 1] : Infinity;
+                let neigh = Math.min(left, right);
+                if (neigh > colHeights[x]) wellDepth += (neigh - colHeights[x]);
+            }
+
+            // landing height
+            let landingHeight = aggregateHeight / nx;
+
+            // row transitions + column transitions
+            let rowTransitions = 0;
+            let colTransitions = 0;
+
+            for (let y = 0; y < ny; y++) {
+                let prev = 1;
+                for (let x = 0; x < nx; x++) {
+                    let cur = board[x][y] ? 1 : 0;
+                    if (cur !== prev) rowTransitions++;
+                    prev = cur;
+                }
+                if (prev === 0) rowTransitions++;
+            }
+
+            for (let x = 0; x < nx; x++) {
+                let prev = 1;
+                for (let y = 0; y < ny; y++) {
+                    let cur = board[x][y] ? 1 : 0;
+                    if (cur !== prev) colTransitions++;
+                    prev = cur;
+                }
+                if (prev === 0) colTransitions++;
+            }
+
+            // weighted score
+            return (
+                w[0] * aggregateHeight +
+                w[1] * completeLines +
+                w[2] * holes +
+                w[3] * bumpiness +
+                w[4] * landingHeight +
+                w[5] * rowTransitions +
+                w[6] * colTransitions +
+                w[7] * wellDepth
+            );
+        }
+
+        // ============================
+        // random weights
+        // ============================
+        function randomWeights() {
+            return Array.from({ length: 8 }, () => Math.random() * 2 - 1);
+        }
+
+        // ============================
+        // crossover
+        // ============================
+        function crossover(A, B) {
+            let child = [];
+            for (let i = 0; i < A.length; i++) {
+                child[i] = Math.random() < 0.5 ? A[i] : B[i];
+            }
+            return child;
+        }
+
+        // ============================
+        // mutation
+        // ============================
+        function mutate(w, rate = 0.15) {
+            for (let i = 0; i < w.length; i++) {
+                if (Math.random() < rate) {
+                    w[i] += (Math.random() * 0.2 - 0.1);
+                }
+            }
+            return w;
+        }
+
+        // ============================
+        // simplified piece
+        // ============================
+        function randomPieceFast() {
+            const type = pieceTypes[Math.floor(Math.random() * pieceTypes.length)];
+            return { type, dir: 0 };
+        }
+
+        // ============================
+        // simulate game with given weights
+        // ============================
+        function simulateGame(weights, numPieces = 200) {
+            let board = Array.from({ length: nx }, () => Array(ny).fill(null));
+            let totalLines = 0;
+
+            for (let i = 0; i < numPieces; i++) {
+                let piece = randomPieceFast();
+                let best = selectBestMoveFast(piece, board, weights);
+                if (!best) break;
+
+                eachblock(piece.type, best.x, best.y, best.dir, (bx, by) => {
+                    if (by >= 0 && by < ny) board[bx][by] = 1;
+                });
+
+                totalLines += clearLinesFast(board);
+            }
+            return totalLines;
+        }
+
+        // ============================
+        // clear lines
+        // ============================
+        function clearLinesFast(board) {
+            let lines = 0;
+            for (let y = 0; y < ny; y++) {
+                let full = true;
+                for (let x = 0; x < nx; x++) {
+                    if (!board[x][y]) { full = false; break; }
+                }
+                if (full) {
+                    lines++;
+                    for (let x = 0; x < nx; x++) {
+                        for (let yy = y; yy > 0; yy--) {
+                            board[x][yy] = board[x][yy - 1];
+                        }
+                        board[x][0] = null;
+                    }
+                }
+            }
+            return lines;
+        }
+
+        // ============================
+        // best move search
+        // ============================
+        function selectBestMoveFast(piece, board, weights) {
+            let best = null;
+            let bestScore = -Infinity;
+
+            for (let dir = 0; dir < 4; dir++) {
+                for (let x = 0; x < nx - piece.type.size + 1; x++) {
+                    let y = fastDrop(piece.type, x, dir, board);
+                    if (y === null) continue;
+
+                    let temp = copyBoard(board);
+
+                    eachblock(piece.type, x, y, dir, (bx, by) => {
+                        if (by >= 0 && by < ny) temp[bx][by] = 1;
+                    });
+
+                    let score = fastEvaluateBoard(temp, weights);
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        best = { x, y, dir };
+                    }
+                }
+            }
+            return best;
+        }
+
+        // ============================
+        // TRAINING LOOP (GENETIC ALGO)
+        // ============================
+        function trainGenerations(generations = 20, popSize = 30) {
+
+            // initial population
+            let population = Array.from({ length: popSize }, () => ({
+                weights: randomWeights(),
+                fitness: 0
+            }));
+
+            for (let g = 0; g < generations; g++) {
+
+                // evaluate each individual
+                for (let i = 0; i < popSize; i++) {
+                    population[i].fitness = simulateGame(population[i].weights);
+                }
+
+                // sort by fitness
+                population.sort((a, b) => b.fitness - a.fitness);
+
+                console.log(`GEN ${g}: BEST FITNESS = ${population[0].fitness}`);
+                console.log(`  BEST WEIGHTS = [${population[0].weights.join(', ')}]`);
+
+                // keep top half
+                let survivors = population.slice(0, popSize / 2);
+
+                // reproduce
+                let newPop = [];
+                while (newPop.length < popSize) {
+                    let A = survivors[Math.floor(Math.random() * survivors.length)].weights;
+                    let B = survivors[Math.floor(Math.random() * survivors.length)].weights;
+                    let child = mutate(crossover(A, B));
+                    newPop.push({ weights: child, fitness: 0 });
+                }
+
+                population = newPop;
+            }
+
+            console.log("✅ Training Complete!");
+        }
+
+    </script>
+
+</body>
+
+</html>
